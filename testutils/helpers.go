@@ -71,7 +71,7 @@ func StartTracer(ctx context.Context, t *testing.T, et tracertypes.IncludedTrace
 	traceCh := make(chan *host.Trace)
 
 	// Spawn monitors for the various result maps
-	err = trc.StartMapMonitors(ctx, traceCh)
+	err = trc.StartMapMonitors(traceCh)
 	require.NoError(t, err)
 
 	return traceCh, trc

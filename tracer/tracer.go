@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -118,6 +119,20 @@ type Tracer struct {
 
 	// probabilisticThreshold holds the threshold for probabilistic profiling.
 	probabilisticThreshold uint
+
+	// ctx and cancelFunc are used to manage the lifecycle of background goroutines.
+	ctx        context.Context
+	cancelFunc context.CancelFunc
+
+	// closers contains deferred cleanup functions for resources (e.g., perf readers).
+	closersMu sync.Mutex
+	closers   []func()
+
+	// closeOnce ensures Close is idempotent and thread-safe.
+	closeOnce sync.Once
+
+	// wg tracks background goroutines owned by Tracer for deterministic shutdown.
+	wg sync.WaitGroup
 }
 
 type Config struct {
@@ -190,6 +205,9 @@ func schedProcessFreeHookName(progNames libpf.Set[string]) string {
 
 // NewTracer loads eBPF code and map definitions from the ELF module at the configured path.
 func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
+	// Create a new context for managing the tracer's lifecycle early so all background
+	// components (eBPF handler, process manager) are tied to it.
+	tracerCtx, cancelFunc := context.WithCancel(ctx)
 	kernelSymbolizer, err := kallsyms.NewSymbolizer()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read kernel symbols: %v", err)
@@ -206,14 +224,14 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		return nil, fmt.Errorf("failed to load eBPF code: %v", err)
 	}
 
-	ebpfHandler, err := pmebpf.LoadMaps(ctx, ebpfMaps, ebpfProgs, coll)
+	ebpfHandler, err := pmebpf.LoadMaps(tracerCtx, ebpfMaps, ebpfProgs, coll)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load eBPF maps: %v", err)
 	}
 
 	hasBatchOperations := ebpfHandler.SupportsGenericBatchOperations()
 
-	processManager, err := pm.New(ctx, cfg.IncludeTracers, cfg.Intervals.MonitorInterval(),
+	processManager, err := pm.New(tracerCtx, cfg.IncludeTracers, cfg.Intervals.MonitorInterval(),
 		ebpfHandler, nil, cfg.Reporter, elfunwindinfo.NewStackDeltaProvider(),
 		cfg.FilterErrorFrames, cfg.CollectCustomLabels, cfg.IncludeEnvVars)
 	if err != nil {
@@ -237,6 +255,8 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		samplesPerSecond:       cfg.SamplesPerSecond,
 		probabilisticInterval:  cfg.ProbabilisticInterval,
 		probabilisticThreshold: cfg.ProbabilisticThreshold,
+		ctx:                    tracerCtx,
+		cancelFunc:             cancelFunc,
 	}
 
 	return tracer, nil
@@ -245,27 +265,72 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 // Close provides functionality for Tracer to perform cleanup tasks.
 // NOTE: Close may be called multiple times in succession.
 func (t *Tracer) Close() {
-	events := t.perfEntrypoints.WLock()
-	for _, event := range *events {
-		if err := event.Disable(); err != nil {
-			log.Errorf("Failed to disable perf event: %v", err)
+	t.closeOnce.Do(func() {
+		// Cancel the context to stop all background goroutines
+		if t.cancelFunc != nil {
+			t.cancelFunc()
 		}
-		if err := event.Close(); err != nil {
-			log.Errorf("Failed to close perf event: %v", err)
-		}
-	}
-	*events = nil
-	t.perfEntrypoints.WUnlock(&events)
 
-	// Avoid resource leakage by closing all kernel hooks.
-	for hookPoint, hook := range t.hooks {
-		if err := hook.Close(); err != nil {
-			log.Errorf("Failed to close '%s/%s': %v", hookPoint.group, hookPoint.name, err)
+		t.closersMu.Lock()
+		for _, f := range t.closers {
+			func() {
+				defer func() { _ = recover() }()
+				f()
+			}()
 		}
-		delete(t.hooks, hookPoint)
-	}
+		t.closers = nil
+		t.closersMu.Unlock()
 
-	t.processManager.Close()
+		// Deterministically wait for Tracer-owned goroutines to exit
+		t.wg.Wait()
+
+		// Close perf events
+		events := t.perfEntrypoints.WLock()
+		for _, event := range *events {
+			if err := event.Disable(); err != nil {
+				log.Errorf("Failed to disable perf event: %v", err)
+			}
+			if err := event.Close(); err != nil {
+				log.Errorf("Failed to close perf event: %v", err)
+			}
+		}
+		*events = nil
+		t.perfEntrypoints.WUnlock(&events)
+
+		// Avoid resource leakage by closing all kernel hooks.
+		for hookPoint, hook := range t.hooks {
+			if err := hook.Close(); err != nil {
+				log.Errorf("Failed to close '%s/%s': %v", hookPoint.group, hookPoint.name, err)
+			}
+			delete(t.hooks, hookPoint)
+		}
+
+		// Finalize process manager first, waiting background async updates to stop
+		t.processManager.Close()
+
+		// Close all eBPF programs
+		for name, prog := range t.ebpfProgs {
+			if err := prog.Close(); err != nil {
+				log.Errorf("Failed to close eBPF program '%s': %v", name, err)
+			}
+			delete(t.ebpfProgs, name)
+		}
+
+		// Close all eBPF maps
+		for name, m := range t.ebpfMaps {
+			if err := m.Close(); err != nil {
+				log.Errorf("Failed to close eBPF map '%s': %v", name, err)
+			}
+			delete(t.ebpfMaps, name)
+		}
+	})
+}
+
+// registerCloser appends a cleanup function to be called during Close.
+func (t *Tracer) registerCloser(f func()) {
+	t.closersMu.Lock()
+	defer t.closersMu.Unlock()
+	t.closers = append(t.closers, f)
 }
 
 func buildStackDeltaTemplates(coll *cebpf.CollectionSpec) error {
@@ -968,15 +1033,15 @@ func (t *Tracer) loadBpfTrace(raw []byte, cpu int) *host.Trace {
 
 // StartMapMonitors starts goroutines for collecting metrics and monitoring eBPF
 // maps for tracepoints, new traces, trace count updates and unknown PCs.
-func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan<- *host.Trace) error {
-	if err := t.kernelSymbolizer.StartMonitor(ctx); err != nil {
+func (t *Tracer) StartMapMonitors(traceOutChan chan<- *host.Trace) error {
+	if err := t.kernelSymbolizer.StartMonitor(t.ctx); err != nil {
 		log.Warnf("Failed to start kallsyms monitor: %v", err)
 	}
-	eventMetricCollector := t.startEventMonitor(ctx)
-	traceEventMetricCollector := t.startTraceEventMonitor(ctx, traceOutChan)
+	eventMetricCollector := t.startEventMonitor(t.ctx)
+	traceEventMetricCollector := t.startTraceEventMonitor(t.ctx, traceOutChan)
 
 	pidEvents := make([]libpf.PIDTID, 0)
-	periodiccaller.StartWithManualTrigger(ctx, t.intervals.MonitorInterval(),
+	periodiccaller.StartWithManualTrigger(t.ctx, t.intervals.MonitorInterval(),
 		t.triggerPIDProcessing, func(_ bool) {
 			t.enableEvent(support.EventTypeGenericPID)
 			t.monitorPIDEventsMap(&pidEvents)
@@ -998,7 +1063,7 @@ func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan<- *host
 	// calculate and store delta values.
 	previousMetricValue := make([]metrics.MetricValue, len(translateIDs))
 
-	periodiccaller.Start(ctx, t.intervals.MonitorInterval(), func() {
+	periodiccaller.Start(t.ctx, t.intervals.MonitorInterval(), func() {
 		metrics.AddSlice(eventMetricCollector())
 		metrics.AddSlice(traceEventMetricCollector())
 		metrics.AddSlice(t.eBPFMetricsCollector(translateIDs, previousMetricValue))
@@ -1111,7 +1176,7 @@ func (t *Tracer) StartProbabilisticProfiling(ctx context.Context) {
 	// before getting called.
 	t.probabilisticProfile(t.probabilisticInterval, t.probabilisticThreshold)
 
-	periodiccaller.Start(ctx, t.probabilisticInterval, func() {
+	periodiccaller.Start(t.ctx, t.probabilisticInterval, func() {
 		t.probabilisticProfile(t.probabilisticInterval, t.probabilisticThreshold)
 	})
 }
