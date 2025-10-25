@@ -12,6 +12,8 @@ import (
 	"math"
 	"math/rand/v2"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -118,6 +120,24 @@ type Tracer struct {
 
 	// probabilisticThreshold holds the threshold for probabilistic profiling.
 	probabilisticThreshold uint
+
+	// ctx is the internal context for managing all goroutines started by this Tracer.
+	// It is derived from the parent context passed to NewTracer and will be cancelled
+	// when Close() is called.
+	ctx context.Context
+
+	// cancelFunc cancels the internal context, signaling all goroutines to stop.
+	cancelFunc context.CancelFunc
+
+	// wg tracks all goroutines started by this Tracer to ensure graceful shutdown.
+	wg sync.WaitGroup
+
+	// closeOnce ensures that Close() is idempotent and can be safely called multiple times.
+	closeOnce sync.Once
+
+	// closed indicates whether the tracer has been closed. Used to prevent operations
+	// on a closed tracer and for state checking.
+	closed atomic.Bool
 }
 
 type Config struct {
@@ -222,6 +242,9 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 
 	perfEventList := []*perf.Event{}
 
+	// Create internal context derived from parent context for goroutine lifecycle management
+	tracerCtx, cancel := context.WithCancel(ctx)
+
 	tracer := &Tracer{
 		kernelSymbolizer:       kernelSymbolizer,
 		processManager:         processManager,
@@ -237,35 +260,171 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		samplesPerSecond:       cfg.SamplesPerSecond,
 		probabilisticInterval:  cfg.ProbabilisticInterval,
 		probabilisticThreshold: cfg.ProbabilisticThreshold,
+		// Lifecycle management
+		ctx:        tracerCtx,
+		cancelFunc: cancel,
 	}
 
 	return tracer, nil
 }
 
-// Close provides functionality for Tracer to perform cleanup tasks.
-// NOTE: Close may be called multiple times in succession.
+// Close gracefully shuts down the Tracer, stopping all goroutines and releasing all resources.
+// This method is idempotent and can be safely called multiple times.
+//
+// The shutdown process follows these steps:
+//  1. Cancel internal context to signal all goroutines to stop
+//  2. Wait for all goroutines to exit (with 5 second timeout)
+//  3. Disable and close all perf events
+//  4. Close all kernel hooks (kprobes/tracepoints/uprobes)
+//  5. Close the process manager
+//  6. Close channels to prevent further sends
+//  7. Close all eBPF maps and programs
+//
+// NOTE: After Close() is called, the Tracer should not be used anymore.
 func (t *Tracer) Close() {
-	events := t.perfEntrypoints.WLock()
-	for _, event := range *events {
-		if err := event.Disable(); err != nil {
-			log.Errorf("Failed to disable perf event: %v", err)
+	t.closeOnce.Do(func() {
+		if t.closed.Load() {
+			log.Debug("Tracer already closed, skipping")
+			return
 		}
-		if err := event.Close(); err != nil {
-			log.Errorf("Failed to close perf event: %v", err)
+
+		log.Info("Initiating Tracer shutdown...")
+		startTime := time.Now()
+
+		// Step 1: Signal all goroutines to stop by cancelling the internal context
+		if t.cancelFunc != nil {
+			log.Debug("Cancelling context to stop all goroutines")
+			t.cancelFunc()
+		}
+
+		// Step 2: Wait for all goroutines to exit with a timeout
+		done := make(chan struct{})
+		go func() {
+			t.wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			log.Debug("All goroutines stopped gracefully")
+		case <-time.After(5 * time.Second):
+			log.Warn("Timeout waiting for goroutines to stop, proceeding with cleanup")
+		}
+
+		// Step 3: Disable and close all perf events
+		log.Debug("Closing perf events")
+		events := t.perfEntrypoints.WLock()
+		for i, event := range *events {
+			if event == nil {
+				continue
+			}
+			if err := event.Disable(); err != nil {
+				log.Errorf("Failed to disable perf event on CPU %d: %v", i, err)
+			}
+			if err := event.Close(); err != nil {
+				log.Errorf("Failed to close perf event on CPU %d: %v", i, err)
+			}
+		}
+		*events = nil
+		t.perfEntrypoints.WUnlock(&events)
+
+		// Step 4: Close all kernel hooks
+		log.Debug("Closing kernel hooks")
+		for hp, hook := range t.hooks {
+			if hook == nil {
+				continue
+			}
+			if err := hook.Close(); err != nil {
+				log.Errorf("Failed to close hook '%s/%s': %v", hp.group, hp.name, err)
+			}
+			delete(t.hooks, hp)
+		}
+
+		// Step 5: Close process manager
+		log.Debug("Closing process manager")
+		if t.processManager != nil {
+			t.processManager.Close()
+		}
+
+		// Step 6: Close channels safely (after goroutines have stopped)
+		// Note: We close these after goroutines exit to avoid send-on-closed-channel panics
+		log.Debug("Closing channels")
+		t.safeCloseChannels()
+
+		// Step 7: Close all eBPF resources
+		log.Debug("Closing eBPF maps and programs")
+		t.closeEBPFResources()
+
+		// Mark as closed
+		t.closed.Store(true)
+		log.Infof("Tracer shutdown completed in %v", time.Since(startTime))
+	})
+}
+
+// safeCloseChannels closes all channels with panic recovery to prevent crashes.
+func (t *Tracer) safeCloseChannels() {
+	// Close triggerPIDProcessing channel
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Warnf("Recovered from panic closing triggerPIDProcessing channel: %v", r)
+			}
+		}()
+		if t.triggerPIDProcessing != nil {
+			close(t.triggerPIDProcessing)
+		}
+	}()
+
+	// Close pidEvents channel
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Warnf("Recovered from panic closing pidEvents channel: %v", r)
+			}
+		}()
+		if t.pidEvents != nil {
+			close(t.pidEvents)
+		}
+	}()
+}
+
+// closeEBPFResources closes all eBPF maps and programs and clears the maps.
+func (t *Tracer) closeEBPFResources() {
+	// Close all eBPF maps
+	for name, m := range t.ebpfMaps {
+		if m == nil {
+			continue
+		}
+		if err := m.Close(); err != nil {
+			log.Errorf("Failed to close eBPF map '%s': %v", name, err)
 		}
 	}
-	*events = nil
-	t.perfEntrypoints.WUnlock(&events)
 
-	// Avoid resource leakage by closing all kernel hooks.
-	for hookPoint, hook := range t.hooks {
-		if err := hook.Close(); err != nil {
-			log.Errorf("Failed to close '%s/%s': %v", hookPoint.group, hookPoint.name, err)
+	// Close all eBPF programs
+	for name, prog := range t.ebpfProgs {
+		if prog == nil {
+			continue
 		}
-		delete(t.hooks, hookPoint)
+		if err := prog.Close(); err != nil {
+			log.Errorf("Failed to close eBPF program '%s': %v", name, err)
+		}
 	}
 
-	t.processManager.Close()
+	// Clear maps to help garbage collection
+	t.ebpfMaps = nil
+	t.ebpfProgs = nil
+	t.hooks = nil
+}
+
+// IsClosed returns true if the tracer has been closed.
+func (t *Tracer) IsClosed() bool {
+	return t.closed.Load()
+}
+
+// Context returns the tracer's internal context, useful for external goroutines
+// that need to coordinate with the tracer's lifecycle.
+func (t *Tracer) Context() context.Context {
+	return t.ctx
 }
 
 func buildStackDeltaTemplates(coll *cebpf.CollectionSpec) error {
@@ -968,15 +1127,15 @@ func (t *Tracer) loadBpfTrace(raw []byte, cpu int) *host.Trace {
 
 // StartMapMonitors starts goroutines for collecting metrics and monitoring eBPF
 // maps for tracepoints, new traces, trace count updates and unknown PCs.
-func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan<- *host.Trace) error {
-	if err := t.kernelSymbolizer.StartMonitor(ctx); err != nil {
+func (t *Tracer) StartMapMonitors(traceOutChan chan<- *host.Trace) error {
+	if err := t.kernelSymbolizer.StartMonitor(t.ctx); err != nil {
 		log.Warnf("Failed to start kallsyms monitor: %v", err)
 	}
-	eventMetricCollector := t.startEventMonitor(ctx)
-	traceEventMetricCollector := t.startTraceEventMonitor(ctx, traceOutChan)
+	eventMetricCollector := t.startEventMonitor(t.ctx)
+	traceEventMetricCollector := t.startTraceEventMonitor(t.ctx, traceOutChan)
 
 	pidEvents := make([]libpf.PIDTID, 0)
-	periodiccaller.StartWithManualTrigger(ctx, t.intervals.MonitorInterval(),
+	periodiccaller.StartWithManualTrigger(t.ctx, t.intervals.MonitorInterval(),
 		t.triggerPIDProcessing, func(_ bool) {
 			t.enableEvent(support.EventTypeGenericPID)
 			t.monitorPIDEventsMap(&pidEvents)
@@ -998,7 +1157,7 @@ func (t *Tracer) StartMapMonitors(ctx context.Context, traceOutChan chan<- *host
 	// calculate and store delta values.
 	previousMetricValue := make([]metrics.MetricValue, len(translateIDs))
 
-	periodiccaller.Start(ctx, t.intervals.MonitorInterval(), func() {
+	periodiccaller.Start(t.ctx, t.intervals.MonitorInterval(), func() {
 		metrics.AddSlice(eventMetricCollector())
 		metrics.AddSlice(traceEventMetricCollector())
 		metrics.AddSlice(t.eBPFMetricsCollector(translateIDs, previousMetricValue))
@@ -1102,7 +1261,7 @@ func (t *Tracer) probabilisticProfile(interval time.Duration, threshold uint) {
 }
 
 // StartProbabilisticProfiling periodically runs probabilistic profiling.
-func (t *Tracer) StartProbabilisticProfiling(ctx context.Context) {
+func (t *Tracer) StartProbabilisticProfiling() {
 	metrics.Add(metrics.IDProbProfilingInterval,
 		metrics.MetricValue(t.probabilisticInterval.Seconds()))
 
@@ -1111,7 +1270,7 @@ func (t *Tracer) StartProbabilisticProfiling(ctx context.Context) {
 	// before getting called.
 	t.probabilisticProfile(t.probabilisticInterval, t.probabilisticThreshold)
 
-	periodiccaller.Start(ctx, t.probabilisticInterval, func() {
+	periodiccaller.Start(t.ctx, t.probabilisticInterval, func() {
 		t.probabilisticProfile(t.probabilisticInterval, t.probabilisticThreshold)
 	})
 }

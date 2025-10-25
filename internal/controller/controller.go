@@ -109,7 +109,7 @@ func (c *Controller) Start(ctx context.Context) error {
 
 	now := time.Now()
 
-	trc.StartPIDEventProcessor(ctx)
+	trc.StartPIDEventProcessor()
 
 	metrics.Add(metrics.IDProcPIDStartupMs, metrics.MetricValue(time.Since(now).Milliseconds()))
 	log.Debug("Completed initial PID listing")
@@ -135,7 +135,7 @@ func (c *Controller) Start(ctx context.Context) error {
 	}
 
 	if c.config.ProbabilisticThreshold < tracer.ProbabilisticThresholdMax {
-		trc.StartProbabilisticProfiling(ctx)
+		trc.StartProbabilisticProfiling()
 		log.Printf("Enabled probabilistic profiling")
 	} else {
 		if err := trc.EnableProfiling(); err != nil {
@@ -176,7 +176,7 @@ func startTraceHandling(ctx context.Context, rep reporter.TraceReporter,
 	// Spawn monitors for the various result maps
 	traceCh := make(chan *host.Trace)
 
-	if err := trc.StartMapMonitors(ctx, traceCh); err != nil {
+	if err := trc.StartMapMonitors(traceCh); err != nil {
 		return fmt.Errorf("failed to start map monitors: %v", err)
 	}
 

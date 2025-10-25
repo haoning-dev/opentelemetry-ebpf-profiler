@@ -186,6 +186,29 @@ func collectInterpreterMetrics(ctx context.Context, pm *ProcessManager,
 }
 
 func (pm *ProcessManager) Close() {
+	// Trigger exit handling for all known PIDs to cleanup kernel/user state.
+	// Collect PIDs under read lock to avoid holding the lock while doing work.
+	pids := make([]libpf.PID, 0, 64)
+	pm.mu.RLock()
+	for pid := range pm.pidToProcessInfo {
+		pids = append(pids, pid)
+	}
+	pm.mu.RUnlock()
+
+	for _, pid := range pids {
+		pm.processPIDExit(pid)
+	}
+
+	// Ensure the deletions are applied and interpreter instances are detached.
+	pm.ProcessedUntil(times.GetKTime())
+
+	// Best-effort: drop references to caches and maps to aid GC and avoid stale state.
+	pm.mu.Lock()
+	// Reset maps that hold per-PID state.
+	pm.interpreters = make(map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance)
+	pm.pidToProcessInfo = make(map[libpf.PID]*processInfo)
+	pm.exitEvents = make(map[libpf.PID]times.KTime)
+	pm.mu.Unlock()
 }
 
 func (pm *ProcessManager) symbolizeFrame(frame int, trace *host.Trace, frames *libpf.Frames) error {

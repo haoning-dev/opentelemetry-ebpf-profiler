@@ -37,21 +37,41 @@ const (
 )
 
 // StartPIDEventProcessor spawns a goroutine to process PID events.
-func (t *Tracer) StartPIDEventProcessor(ctx context.Context) {
-	go t.processPIDEvents(ctx)
+func (t *Tracer) StartPIDEventProcessor() {
+	t.wg.Add(1)
+	go func() {
+		defer t.wg.Done()
+		defer log.Debug("PID event processor goroutine exited")
+		t.processPIDEvents()
+	}()
 }
 
 // Process the PID events that are incoming in the Tracer channel.
-func (t *Tracer) processPIDEvents(ctx context.Context) {
+func (t *Tracer) processPIDEvents() {
 	pidCleanupTicker := time.NewTicker(t.intervals.PIDCleanupInterval())
 	defer pidCleanupTicker.Stop()
+
 	for {
 		select {
-		case pidTid := <-t.pidEvents:
+		case pidTid, ok := <-t.pidEvents:
+			if !ok {
+				// Channel closed, exit gracefully
+				log.Debug("pidEvents channel closed, exiting processor")
+				return
+			}
+			if t.closed.Load() {
+				return
+			}
 			t.processManager.SynchronizeProcess(process.New(pidTid.PID(), pidTid.TID()))
+
 		case <-pidCleanupTicker.C:
+			if t.closed.Load() {
+				return
+			}
 			t.processManager.CleanupPIDs()
-		case <-ctx.Done():
+
+		case <-t.ctx.Done():
+			log.Debug("PID event processor stopped by context cancellation")
 			return
 		}
 	}
