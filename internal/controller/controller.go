@@ -180,7 +180,7 @@ func startTraceHandling(ctx context.Context, rep reporter.TraceReporter,
 		return fmt.Errorf("failed to start map monitors: %v", err)
 	}
 
-	_, err := tracehandler.Start(ctx, rep, trc.TraceProcessor(),
+	_, err := tracehandler.Start(ctx, trc.Context(), rep, trc.TraceProcessor(),
 		traceCh, intervals, cacheSize)
 	return err
 }

@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand/v2"
 	"strings"
@@ -138,6 +139,10 @@ type Tracer struct {
 	// closed indicates whether the tracer has been closed. Used to prevent operations
 	// on a closed tracer and for state checking.
 	closed atomic.Bool
+
+	// === Readers for perf event buffers (must be closed to release FDs) ===
+	traceEventReader  io.Closer
+	reportEventReader io.Closer
 }
 
 type Config struct {
@@ -311,7 +316,21 @@ func (t *Tracer) Close() {
 			log.Warn("Timeout waiting for goroutines to stop, proceeding with cleanup")
 		}
 
-		// Step 3: Disable and close all perf events
+		// Step 3: Close perf readers first to unblock any ReadInto and release FDs
+		if t.traceEventReader != nil {
+			if err := t.traceEventReader.Close(); err != nil {
+				log.Warnf("Failed to close traceEventReader: %v", err)
+			}
+			t.traceEventReader = nil
+		}
+		if t.reportEventReader != nil {
+			if err := t.reportEventReader.Close(); err != nil {
+				log.Warnf("Failed to close reportEventReader: %v", err)
+			}
+			t.reportEventReader = nil
+		}
+
+		// Step 4: Disable and close all perf events
 		log.Debug("Closing perf events")
 		events := t.perfEntrypoints.WLock()
 		for i, event := range *events {
@@ -328,7 +347,7 @@ func (t *Tracer) Close() {
 		*events = nil
 		t.perfEntrypoints.WUnlock(&events)
 
-		// Step 4: Close all kernel hooks
+		// Step 5: Close all kernel hooks
 		log.Debug("Closing kernel hooks")
 		for hp, hook := range t.hooks {
 			if hook == nil {
@@ -340,18 +359,18 @@ func (t *Tracer) Close() {
 			delete(t.hooks, hp)
 		}
 
-		// Step 5: Close process manager
+		// Step 6: Close process manager
 		log.Debug("Closing process manager")
 		if t.processManager != nil {
 			t.processManager.Close()
 		}
 
-		// Step 6: Close channels safely (after goroutines have stopped)
+		// Step 7: Close channels safely (after goroutines have stopped)
 		// Note: We close these after goroutines exit to avoid send-on-closed-channel panics
 		log.Debug("Closing channels")
 		t.safeCloseChannels()
 
-		// Step 7: Close all eBPF resources
+		// Step 8: Close all eBPF resources
 		log.Debug("Closing eBPF maps and programs")
 		t.closeEBPFResources()
 

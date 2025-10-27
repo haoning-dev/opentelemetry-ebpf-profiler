@@ -6,6 +6,7 @@ package tracer // import "go.opentelemetry.io/ebpf-profiler/tracer"
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"sync/atomic"
 	"time"
@@ -108,10 +109,13 @@ func (t *Tracer) triggerPidEvent(data []byte) {
 // calls. Returns a function that can be called to retrieve perf event array
 // error counts.
 func startPerfEventMonitor(ctx context.Context, perfEventMap *ebpf.Map,
-	triggerFunc func([]byte), perCPUBufferSize int) func() (lost, noData, readError uint64) {
+	triggerFunc func([]byte), perCPUBufferSize int, setCloser func(io.Closer)) func() (lost, noData, readError uint64) {
 	eventReader, err := perf.NewReader(perfEventMap, perCPUBufferSize)
 	if err != nil {
 		log.Fatalf("Failed to setup perf reporting via %s: %v", perfEventMap, err)
+	}
+	if setCloser != nil {
+		setCloser(eventReader)
 	}
 
 	var lostEventsCount, readErrorCount, noDataCount atomic.Uint64
@@ -161,6 +165,8 @@ func (t *Tracer) startTraceEventMonitor(ctx context.Context,
 	if err != nil {
 		log.Fatalf("Failed to setup perf reporting via %s: %v", eventsMap, err)
 	}
+
+	t.traceEventReader = eventReader
 
 	// A deadline of zero is treated as "no deadline". A deadline in the past
 	// means "always return immediately". We thus set a deadline 1 second after
@@ -300,7 +306,9 @@ func (t *Tracer) startEventMonitor(ctx context.Context) func() []metrics.Metric 
 		log.Fatalf("Map report_events is not available")
 	}
 
-	getPerfErrorCounts := startPerfEventMonitor(ctx, eventMap, t.triggerPidEvent, os.Getpagesize())
+	getPerfErrorCounts := startPerfEventMonitor(ctx, eventMap, t.triggerPidEvent, os.Getpagesize(), func(c io.Closer) {
+		t.reportEventReader = c
+	})
 	return func() []metrics.Metric {
 		lost, noData, readError := getPerfErrorCounts()
 

@@ -162,7 +162,7 @@ func (m *traceHandler) HandleTrace(bpfTrace *host.Trace) {
 // the given channel. Updates are sent periodically to the collection agent.
 // The returned channel allows the caller to wait for the background worker
 // to exit after a cancellation through the context.
-func Start(ctx context.Context, rep reporter.TraceReporter, traceProcessor TraceProcessor,
+func Start(ctx context.Context, tracerCtx context.Context, rep reporter.TraceReporter, traceProcessor TraceProcessor,
 	traceInChan <-chan *host.Trace, intervals Times, cacheSize uint32,
 ) (workerExited <-chan libpf.Void, err error) {
 	handler, err :=
@@ -188,6 +188,8 @@ func Start(ctx context.Context, rep reporter.TraceReporter, traceProcessor Trace
 				}
 			case <-metricsTicker.C:
 				handler.collectMetrics()
+			case <-tracerCtx.Done():
+				return
 			case <-ctx.Done():
 				return
 			}
