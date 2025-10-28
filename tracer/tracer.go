@@ -113,6 +113,9 @@ type Tracer struct {
 	// samplesPerSecond holds the configured number of samples per second.
 	samplesPerSecond int
 
+	// maxSamplesPerSecond holds the maximum allowed number of samples per second.
+	maxSamplesPerSecond int
+
 	// probabilisticInterval is the time interval for which probabilistic profiling will be enabled.
 	probabilisticInterval time.Duration
 
@@ -129,6 +132,8 @@ type Config struct {
 	IncludeTracers types.IncludedTracers
 	// SamplesPerSecond holds the number of samples per second.
 	SamplesPerSecond int
+	// MaxSamplesPerSecond caps the maximum allowed samples per second.
+	MaxSamplesPerSecond int
 	// MapScaleFactor is the scaling factor for eBPF map sizes.
 	MapScaleFactor int
 	// FilterErrorFrames indicates whether error frames should be filtered.
@@ -190,6 +195,10 @@ func schedProcessFreeHookName(progNames libpf.Set[string]) string {
 
 // NewTracer loads eBPF code and map definitions from the ELF module at the configured path.
 func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
+	if cfg.MaxSamplesPerSecond > 0 && cfg.SamplesPerSecond > cfg.MaxSamplesPerSecond {
+		return nil, fmt.Errorf("sampling frequency %d exceeds max limit %d", cfg.SamplesPerSecond, cfg.MaxSamplesPerSecond)
+	}
+
 	kernelSymbolizer, err := kallsyms.NewSymbolizer()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read kernel symbols: %v", err)
@@ -235,6 +244,7 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		perfEntrypoints:        xsync.NewRWMutex(perfEventList),
 		reporter:               cfg.Reporter,
 		samplesPerSecond:       cfg.SamplesPerSecond,
+		maxSamplesPerSecond:    cfg.MaxSamplesPerSecond,
 		probabilisticInterval:  cfg.ProbabilisticInterval,
 		probabilisticThreshold: cfg.ProbabilisticThreshold,
 	}
@@ -1208,6 +1218,10 @@ func (t *Tracer) UpdateSamplingFrequency(newSamplesPerSecond int) error {
 		return fmt.Errorf("invalid sampling frequency: %d", newSamplesPerSecond)
 	}
 
+	if t.maxSamplesPerSecond > 0 && newSamplesPerSecond > t.maxSamplesPerSecond {
+		return fmt.Errorf("requested sampling frequency %d exceeds max limit %d", newSamplesPerSecond, t.maxSamplesPerSecond)
+	}
+
 	events := t.perfEntrypoints.WLock()
 	defer t.perfEntrypoints.WUnlock(&events)
 
@@ -1227,7 +1241,7 @@ func (t *Tracer) UpdateSamplingFrequency(newSamplesPerSecond int) error {
 	}
 
 	if len(updateErrors) > 0 {
-		return fmt.Errorf("failed to update sampling frequency on %d CPUs: %v", len(updateErrors), updateErrors)
+		return fmt.Errorf("failed to update sampling frequency on %d CPUs: %v", len(updateErrors), errors.Join(updateErrors...))
 	}
 
 	// Update the internal samplesPerSecond field

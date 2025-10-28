@@ -28,6 +28,7 @@ type Config struct {
 	ProbabilisticThreshold uint
 	ReporterInterval       time.Duration
 	SamplesPerSecond       int
+	MaxSamplesPerSecond    int
 	SendErrorFrames        bool
 	Tracers                string
 	VerboseMode            bool
@@ -62,6 +63,13 @@ func (cfg *Config) Dump() {
 func (cfg *Config) Validate() error {
 	if cfg.SamplesPerSecond < 1 {
 		return fmt.Errorf("invalid sampling frequency: %d", cfg.SamplesPerSecond)
+	}
+
+	if cfg.MaxSamplesPerSecond < 0 {
+		return fmt.Errorf("invalid max sampling frequency: %d", cfg.MaxSamplesPerSecond)
+	}
+	if cfg.MaxSamplesPerSecond > 0 && cfg.SamplesPerSecond > cfg.MaxSamplesPerSecond {
+		return fmt.Errorf("sampling frequency %d exceeds max limit %d", cfg.SamplesPerSecond, cfg.MaxSamplesPerSecond)
 	}
 
 	if cfg.MapScaleFactor > 8 {
