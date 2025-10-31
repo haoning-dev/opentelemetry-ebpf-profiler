@@ -44,3 +44,8 @@ func New(samplesPerSecond int, executablesCacheElements uint32,
 func (p *Pdata) Purge() {
 	p.Executables.PurgeExpired()
 }
+
+// UpdateSamplingFrequency updates the sampling frequency used in profile generation.
+func (p *Pdata) UpdateSamplingFrequency(samplesPerSecond int) {
+	p.samplesPerSecond = samplesPerSecond
+}

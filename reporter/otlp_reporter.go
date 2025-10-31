@@ -6,6 +6,7 @@ package reporter // import "go.opentelemetry.io/ebpf-profiler/reporter"
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -133,6 +134,22 @@ func (r *OTLPReporter) reportOTLPProfile(ctx context.Context) error {
 	defer ctxCancel()
 	_, err = r.client.Export(reqCtx, req, gzipOption)
 	return err
+}
+
+// Flush immediately reports all currently accumulated trace events.
+// This ensures that data collected with the old sampling frequency is sent
+// before updating to a new sampling frequency.
+func (r *OTLPReporter) Flush(ctx context.Context) error {
+	return r.reportOTLPProfile(ctx)
+}
+
+// UpdateSamplingFrequency updates the sampling frequency used in profile generation.
+// It first flushes accumulated data to ensure data isolation, then updates the frequency.
+func (r *OTLPReporter) UpdateSamplingFrequency(ctx context.Context, samplesPerSecond int) error {
+	if err := r.Flush(ctx); err != nil {
+		return fmt.Errorf("failed to flush reporter before updating sampling frequency: %w", err)
+	}
+	return r.baseReporter.UpdateSamplingFrequency(samplesPerSecond)
 }
 
 // waitGrpcEndpoint waits until the gRPC connection is established.

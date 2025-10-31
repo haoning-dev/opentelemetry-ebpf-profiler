@@ -40,6 +40,11 @@ func (b *baseReporter) Stop() {
 	b.runLoop.Stop()
 }
 
+func (b *baseReporter) UpdateSamplingFrequency(samplesPerSecond int) error {
+	b.pdata.UpdateSamplingFrequency(samplesPerSecond)
+	return nil
+}
+
 func (b *baseReporter) ExecutableKnown(fileID libpf.FileID) bool {
 	_, known := b.pdata.Executables.GetAndRefresh(fileID, pdata.ExecutableCacheLifetime)
 	return known
