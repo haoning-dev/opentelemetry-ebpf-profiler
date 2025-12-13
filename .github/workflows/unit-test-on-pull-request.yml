@@ -222,29 +222,38 @@ jobs:
           esac
           support/run-tests.sh ${{ matrix.kernel }}
   interpreter-integration-tests:
-    name: Interpreter integration
+    name: Interpreter integration (${{ matrix.target_arch }}, ${{ matrix.test_type }})
     runs-on: ubuntu-24.04
     strategy:
       matrix:
         target_arch: [amd64, arm64]
+        test_type: [stable, known-failing]
     steps:
       - name: Clone code
         uses: actions/checkout@v4
       - name: Set up environment
         uses: ./.github/workflows/env
-      - name: Test interpreter integration
+      - name: Test interpreter integration (stable tests)
+        if: matrix.test_type == 'stable'
         run: |
           uname -a
-          sudo go test ./interpreter/... -v -run TestIntegration
+          sudo go test ./interpreter/... -v -run TestIntegration -skip "TestIntegration/(node-local-nightly|node-latest)"
+      - name: Test interpreter integration (known failing tests)
+        if: matrix.test_type == 'known-failing'
+        continue-on-error: true
+        run: |
+          uname -a
+          sudo go test ./interpreter/... -v -run "TestIntegration/(node-local-nightly|node-latest)"
 
-  rtld-qemu-tests:
-    name: RTLD QEMU tests (kernel ${{ matrix.kernel }})
+  distro-qemu-tests:
+    name: Full distro QEMU tests (kernel ${{ matrix.kernel }})
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       matrix:
         kernel:
-          - 5.10.217  # Pre-6.6, uses single-shot mode
+          #- 5.10.217  # 5.10 doesn't have bpf cookies
+          - 5.15.159
           - 6.8.10    # Post-6.6, supports multi-uprobe
     steps:
       - name: Clone code
@@ -257,12 +266,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y qemu-system-x86 debootstrap
+          sudo apt-get install -y qemu-system-x86 debootstrap systemtap-sdt-dev
       - name: Download kernel
         run: |
-          cd test/rtld-qemu
+          cd test/distro-qemu
           ./download-kernel.sh ${{ matrix.kernel }}
       - name: Run RTLD tests in QEMU
         run: |
-          cd test/rtld-qemu
+          cd test/distro-qemu
           ./build-and-run.sh ${{ matrix.kernel }}

@@ -465,6 +465,11 @@ type v8Data struct {
 			LineEnds uint16 `name:"line_ends__Object"`
 			Source   uint16 `name:"source__Object"`
 		}
+
+		InliningPositions struct {
+			// https://chromium.googlesource.com/v8/v8.git/+/refs/tags/12.8.374.13/src/objects/deoptimization-data-inl.h#28
+			TrustedByteArray bool
+		} `name:""`
 	}
 
 	// snapshotRange is the LOAD segment area where V8 Snapshot code blob is
@@ -1287,7 +1292,11 @@ func (i *v8Instance) readCode(taggedPtr libpf.Address, cookie uint32, sfi *v8SFI
 		// Read the complete inlining positions structure
 		inliningPositionsPtr := npsr.Ptr(deoptimizationData,
 			uint(vms.DeoptimizationDataIndex.InliningPositions*pointerSize))
-		inliningPositionsPtr, err = i.getTypedObject(inliningPositionsPtr, vms.Type.ByteArray)
+		expectedTag = vms.Type.ByteArray
+		if vms.InliningPositions.TrustedByteArray {
+			expectedTag = vms.Type.TrustedByteArray
+		}
+		inliningPositionsPtr, err = i.getTypedObject(inliningPositionsPtr, expectedTag)
 		if err != nil {
 			return nil, fmt.Errorf("inlining position pointer read: %v", err)
 		}
@@ -2074,6 +2083,25 @@ func (d *v8Data) readIntrospectionData(ef *pfelf.File) error {
 		vms.DeoptimizationLiteralArray.WeakFixedArray = true
 	}
 
+	if vms.DeoptimizationLiteralArray.TrustedWeakFixedArray && vms.Type.TrustedWeakFixedArray == 0 {
+		if d.version >= v8Ver(12, 8, 0) {
+			// Since 134fcd57b07, there is another
+			// type between TrustedFixedArray and TrustedWeakFixedArray
+			// (to wit: TrustedForeign).
+			vms.Type.TrustedWeakFixedArray = vms.Type.TrustedFixedArray + 2
+		} else {
+			// Before that, TrustedWeakFixedArray
+			// immediately follows TrustedFixedArray.
+			vms.Type.TrustedWeakFixedArray = vms.Type.TrustedFixedArray + 1
+		}
+	}
+
+	// Changed from ByteArray to TrustedByteArray
+	// in f6c936e836b4d8ffafe790bcc3586f2ba5ffcf74
+	if d.version >= v8Ver(12, 6, 0) {
+		vms.InliningPositions.TrustedByteArray = true
+	}
+
 	for i := 0; i < vmVal.NumField(); i++ {
 		classVal := vmVal.Field(i)
 		classType := vmType.Field(i)
@@ -2096,12 +2124,6 @@ func (d *v8Data) readIntrospectionData(ef *pfelf.File) error {
 
 // loadNodeClData loads various offsets that are needed for custom labels handling.
 func (d *v8Data) loadNodeClData(ef *pfelf.File) error {
-	offset, err := ef.LookupTLSSymbolOffset("_ZN2v88internal18g_current_isolate_E")
-	if err != nil {
-		return err
-	}
-	d.isolateSym = libpf.Address(offset)
-
 	syms, err := ef.ReadSymbols()
 	if err != nil {
 		return fmt.Errorf("failed to read symbols: %w", err)
@@ -2141,9 +2163,31 @@ func (d *v8Data) loadNodeClData(ef *pfelf.File) error {
 			d.cpedOffset = 640
 			d.wrappedObjectOffset = 32
 		}
-		return nil
+	} else {
+		return fmt.Errorf("Unsupported Node major version: %d", major)
 	}
-	return fmt.Errorf("Unsupported Node major version: %d", major)
+
+	var offset int64
+
+	if major < 26 {
+		offset, err = ef.LookupTLSSymbolOffset("_ZN2v88internal18g_current_isolate_E")
+		if err != nil {
+			return fmt.Errorf("failed to look up g_current_isolate: %w", err)
+		}
+	} else {
+		// Node started building v8 without external dynamic symbols
+		// in major version v26.
+		sym, err = syms.LookupSymbol("_ZN2v88internal18g_current_isolate_E")
+		if err != nil {
+			return fmt.Errorf("failed to look up g_current_isolate (in major 26): %w", err)
+		}
+		offset, err = ef.AdjustTLSSymbol(sym)
+		if err != nil {
+			return fmt.Errorf("failed to adjust TLS symbol: %w", err)
+		}
+	}
+	d.isolateSym = libpf.Address(offset)
+	return nil
 }
 
 func Loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpreter.Data, error) {

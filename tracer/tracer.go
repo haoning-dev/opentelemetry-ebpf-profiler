@@ -150,9 +150,6 @@ type Config struct {
 	FilterErrorFrames bool
 	// KernelVersionCheck indicates whether the kernel version should be checked.
 	KernelVersionCheck bool
-	// CollectCustomLabels determines whether to collect custom labels in
-	// languages that support them.
-	CollectCustomLabels bool
 	// VerboseMode indicates whether to enable verbose output of eBPF tracers.
 	VerboseMode bool
 	// InstrumentCudaLaunch determines whether to instrument calls to `cudaLaunchKernel`.
@@ -233,7 +230,7 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 
 	processManager, err := pm.New(tracerCtx, cfg.IncludeTracers, cfg.Intervals.MonitorInterval(),
 		ebpfHandler, nil, cfg.Reporter, elfunwindinfo.NewStackDeltaProvider(),
-		cfg.FilterErrorFrames, cfg.CollectCustomLabels, cfg.IncludeEnvVars)
+		cfg.FilterErrorFrames, cfg.IncludeEnvVars)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create processManager: %v", err)
 	}
@@ -1259,6 +1256,13 @@ func (t *Tracer) TraceProcessor() tracehandler.TraceProcessor {
 // GetEbpfMaps returns the eBPF maps for testing purposes.
 func (t *Tracer) GetEbpfMaps() map[string]*cebpf.Map {
 	return t.ebpfMaps
+}
+
+// GetEbpfHandler returns the EbpfHandler interface for direct access to eBPF operations.
+// This is primarily used for testing and advanced use cases that need to attach USDT probes
+// or manipulate eBPF maps directly.
+func (t *Tracer) GetEbpfHandler() interpreter.EbpfHandler {
+	return t.processManager.GetEbpfHandler()
 }
 
 // GetInterpretersForPID returns all interpreter instances for the given PID.
